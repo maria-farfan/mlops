@@ -5,9 +5,17 @@ import os
 from sklearn.linear_model import LogisticRegression
 from sklearn.linear_model import LinearRegression
 import xgboost as xgb
-import joblib
 import ast
 from werkzeug.datastructures import FileStorage
+import glob
+import pickle
+from sqlalchemy import create_engine
+
+POSTGRES_HOST = os.environ['POSTGRES_HOST']
+POSTGRES_DB = os.environ['POSTGRES_DB']
+POSTGRES_USER = os.environ['POSTGRES_USER']
+POSTGRES_PASSWORD = os.environ['POSTGRES_PASSWORD']
+POSTGRES_CONN_STRING = f"postgresql+psycopg2://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:5432/{POSTGRES_DB}"
 
 app = Flask(__name__)
 api = Api(
@@ -33,16 +41,8 @@ req_post_args.add_argument("path_model", type=str, location='args',
 req_post_args.add_argument(
     "params", type=str, location='args', help='params of model',
     required=False)
-req_post_args.add_argument("file", location='files',
-                           type=FileStorage, required=True)
 
 req_post_args_file = reqparse.RequestParser()
-req_post_args_file.add_argument(
-    "file",
-    location='files',
-    type=FileStorage,
-    required=True
-)
 req_post_args_file.add_argument(
     "path_model",
     type=str,
@@ -55,7 +55,32 @@ req_delete = reqparse.RequestParser()
 req_delete.add_argument("path_model", type=str, location='args',
                            help='path of model is required',
                            required=True)
+def get_data(conn=POSTGRES_CONN_STRING):
+    engine_postgres = create_engine(conn)
+    data = pd.read_sql_query(
+        """
+        SELECT
+            "col0",
+            "col1",
+            "target"
+        FROM public.dataset;
+        """,
+        engine_postgres
+    )
+    engine_postgres.dispose()
+    return data
+def create_model_store(model_dir):
+    files = glob.glob(f'./{model_dir}/*')
+    model_store = {}
+    for file in files:
+        model_store[file.split('/')[-1][:-4]] = file
+    return model_store
 
+model_dir = 'models'
+if not os.path.exists(model_dir):
+    os.makedirs(model_dir)
+
+model_store = create_model_store(model_dir)
 def error(type_for_check, check_param, task=None):
     if type_for_check == 'task':
         if check_param not in ['classification', 'regression']:
@@ -81,9 +106,7 @@ class TrainModel(Resource):
         (xgb_classifier). Regression: LinearRegression (linreg) or \
          XGBRegressor (xgb_regressor)',
         'params': "Params for training model",
-        'path_model': 'Unique name of your model',
-        'file': "Upload file for training model. \
-        File must contain a column name as 'target'"
+        'path_model': 'Unique name of your model'
     }
     )
     @api.response(201, description='model successfully created')
@@ -105,30 +128,38 @@ class TrainModel(Resource):
         error('task', task)
         error('model', model, task)
 
-        data_train = pd.read_csv(request_data['file'])
+        data_train = get_data(conn=POSTGRES_CONN_STRING)
         y, x = data_train['target'], data_train.drop(columns='target')
 
         if task == 'classification':
             if model == 'logreg':
                 model_train = LogisticRegression(**dict_parameters)
                 model_train.fit(x, y)
-                joblib.dump(model_train, f'models/{path_model}')
+                with open(os.path.join(model_dir, f'{path_model}.pkl'), 'wb') as f:
+                    pickle.dump(model_train, f)
+                model_store[path_model] = os.path.join(model_dir, f'{path_model}.pkl')
                 return 201
             elif model == 'xgb_classifier':
                 model_train = xgb.XGBClassifier(**dict_parameters)
                 model_train.fit(x, y)
-                joblib.dump(model_train, f'models/{path_model}')
+                with open(os.path.join(model_dir, f'{path_model}.pkl'), 'wb') as f:
+                    pickle.dump(model_train, f)
+                model_store[path_model] = os.path.join(model_dir, f'{path_model}.pkl')
                 return 201
         elif task == 'regression':
             if model == 'linreg':
                 model_train = LinearRegression(**dict_parameters)
                 model_train.fit(x, y)
-                joblib.dump(model_train, f'models/{path_model}')
+                with open(os.path.join(model_dir, f'{path_model}.pkl'), 'wb') as f:
+                    pickle.dump(model_train, f)
+                model_store[path_model] = os.path.join(model_dir, f'{path_model}.pkl')
                 return 201
             elif model == 'xgb_regressor':
                 model_train = xgb.XGBRegressor()(**dict_parameters)
                 model_train.fit(x, y)
-                joblib.dump(model_train, f'models/{path_model}')
+                with open(os.path.join(model_dir, f'{path_model}.pkl'), 'wb') as f:
+                    pickle.dump(model_train, f)
+                model_store[path_model] = os.path.join(model_dir, f'{path_model}.pkl')
                 return 201
 
     @api.expect(req_delete)
@@ -139,8 +170,12 @@ class TrainModel(Resource):
         """
         request_data = req_delete.parse_args()
         path_model = request_data.get('path_model')
-        error('path_model', path_model)
-        os.remove(f'models/{path_model}')
+        try:
+            model_path = model_store[path_model]
+            os.remove(model_path)
+            del model_store[path_model]
+        except KeyError:
+            raise KeyError('Model not found')
         return 204
 
 
@@ -148,7 +183,6 @@ class TrainModel(Resource):
 @api.expect(req_post_args_file)
 class ModelPredict(Resource):
     @api.doc(params={
-        'file': 'Choose csv file for prediction (without target)',
         'path_model': 'Input name of your model'
     }
     )
@@ -159,11 +193,12 @@ class ModelPredict(Resource):
         """
         request_data = req_post_args_file.parse_args()
         path_model = request_data.get('path_model')
-        error('path_model', path_model)
-        data_test = pd.read_csv(request_data['file'])
+        model_path = model_store[path_model]
+        with open(model_path, 'rb') as f:
+            model = pickle.load(f)
 
-        model_loaded = joblib.load(f'models/{path_model}')
-        return model_loaded.predict(data_test).tolist()
+        data_test = get_data(conn=POSTGRES_CONN_STRING)
+        return model.predict(data_test).tolist()
 
 
 @api.route('/available_models', methods=['GET'],
@@ -174,9 +209,8 @@ class GetAvailableModels(Resource):
         """
         available model for training
         """
-
         return {'classification': ['logreg', 'xgb_classifier'],
                 'regression': ['linreg', 'xgb_regressor']}
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    app.run(debug=True, port=5000, host='0.0.0.0')

@@ -30,3 +30,6 @@ tomli==2.0.1
 Werkzeug==2.1.2
 xgboost==1.6.2
 zipp==3.9.0
+psycopg2==2.9.3
+SQLAlchemy
+PyYAML
